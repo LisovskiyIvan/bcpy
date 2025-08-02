@@ -87,11 +87,10 @@ async def cleanup_inactive():
                 if end_date < current_time:
                     # Деактивируем подписку
                     crud.deactivate_subscription(db, subscription.id)
-                    # Деактивируем связанные VPN конфигурации
-                    vpn_configs = crud.get_user_vpn_configs(db, subscription.user_id)
-                    for config in vpn_configs:
-                        if config.is_active:
-                            crud.deactivate_vpn_config(db, config.id)
+                    # Деактивируем связанную VPN конфигурацию
+                    vpn_config = crud.get_subscription_vpn_config(db, subscription.id)
+                    if vpn_config and vpn_config.is_active:
+                        crud.deactivate_vpn_config(db, vpn_config.id)
         finally:
             db.close()
         await asyncio.sleep(3600)  # Проверка каждый час
@@ -113,7 +112,11 @@ async def create_user(
 
 @app.get("/api/users/{user_id}")
 async def get_user(user_id: int, db: Session = Depends(get_db)):
-    db_user = crud.get_user(db, user_id)
+    # Сначала пробуем найти по Telegram ID
+    db_user = crud.get_user_by_tg_id(db, user_id)
+    if db_user is None:
+        # Если не найден по Telegram ID, пробуем по внутреннему ID
+        db_user = crud.get_user(db, user_id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     return db_user
@@ -121,17 +124,17 @@ async def get_user(user_id: int, db: Session = Depends(get_db)):
 # Эндпоинты для работы с подписками
 @app.post("/api/subscriptions")
 async def create_subscription(
-    user_id: int = Query(...),
-    days: int = Query(...),
+    user_id: int = Query(..., alias="user_id"),
+    days: int = Query(..., alias="days"),
     db: Session = Depends(get_db)
 ):
-    db_user = crud.get_user(db, user_id)
+    db_user = crud.get_user_by_tg_id(db, user_id)
     if not db_user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
     # Убеждаемся, что end_date создается с UTC
     end_date = datetime.now(UTC) + timedelta(days=days)
-    return crud.create_subscription(db, user_id=user_id, end_date=end_date)
+    return crud.create_subscription(db, user_id=db_user.id, end_date=end_date)
 
 @app.delete("/api/subscriptions/user/{user_id}")
 async def delete_subscription_by_user_id(user_id: int, db: Session = Depends(get_db)):
@@ -144,7 +147,11 @@ async def delete_subscription_by_user_id(user_id: int, db: Session = Depends(get
     return {"message": "Подписка деактивирована"}
 
 @app.put("/api/subscriptions/extend")
-async def extend_subscription(user_id: int, days: int, db: Session = Depends(get_db)):
+async def extend_subscription(
+    user_id: int = Query(..., alias="user_id"),
+    days: int = Query(..., alias="days"),
+    db: Session = Depends(get_db)
+):
     subscription = crud.get_active_subscription(db, user_id)
     if not subscription:
         raise HTTPException(status_code=404, detail="Активная подписка не найдена")
@@ -161,7 +168,7 @@ async def extend_subscription(user_id: int, days: int, db: Session = Depends(get
 # Эндпоинты для работы с VPN
 @app.post("/api/vpn")
 async def create_vpn(
-    user_id: int,
+    user_id: int = Query(..., alias="user_id"),
     db: Session = Depends(get_db)
 ):
     # Проверяем наличие активной подписки
@@ -169,8 +176,13 @@ async def create_vpn(
     if not active_subscription:
         raise HTTPException(status_code=400, detail="Нет активной подписки")
     
+    # Проверяем, есть ли уже VPN конфигурация для этой подписки
+    existing_config = crud.get_subscription_vpn_config(db, active_subscription.id)
+    if existing_config:
+        raise HTTPException(status_code=400, detail="VPN конфигурация уже существует для этой подписки")
+    
     # Генерируем уникальное имя для конфига
-    config_name = f"user_{user_id}_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    config_name = f"user_{user_id}_sub_{active_subscription.id}_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
     
     try:
         # Создаем VPN конфигурацию на сервере
@@ -185,7 +197,7 @@ async def create_vpn(
         # Сохраняем конфигурацию в базе данных
         return crud.create_vpn_config(
             db,
-            user_id=user_id,
+            subscription_id=active_subscription.id,
             config_name=config_name,
             config_content=config_content
         )
@@ -194,17 +206,23 @@ async def create_vpn(
 
 @app.get("/api/vpn/{user_id}")
 async def get_vpn(user_id: int, db: Session = Depends(get_db)):
-    vpn_config = crud.get_active_vpn_config(db, user_id)
+    vpn_config = crud.get_user_active_vpn_config(db, user_id)
     if not vpn_config:
         raise HTTPException(status_code=404, detail="VPN конфигурация не найдена")
     return vpn_config
+
+@app.get("/api/vpn/{user_id}/all")
+async def get_all_user_vpn_configs(user_id: int, db: Session = Depends(get_db)):
+    """Получить все VPN конфигурации пользователя"""
+    vpn_configs = crud.get_user_all_vpn_configs(db, user_id)
+    return {"configs": vpn_configs}
 
 @app.delete("/api/vpn/{user_id}")
 async def delete_vpn(
     user_id: int,
     db: Session = Depends(get_db)
 ):
-    vpn_config = crud.get_active_vpn_config(db, user_id)
+    vpn_config = crud.get_user_active_vpn_config(db, user_id)
     if not vpn_config:
         raise HTTPException(status_code=404, detail="VPN конфигурация не найдена")
     

@@ -38,10 +38,16 @@ def get_user_subscriptions(db: Session, user_id: int):
     return db.query(models.Subscription).filter(models.Subscription.user_id == user_id).all()
 
 def get_active_subscription(db: Session, user_id: int):
+    user = get_user_by_tg_id(db, user_id)
+    if not user:
+        return None
     return db.query(models.Subscription).filter(
-        models.Subscription.user_id == user_id,
+        models.Subscription.user_id == user.id,
         models.Subscription.is_active == True
     ).first()
+
+def get_subscription(db: Session, subscription_id: int):
+    return db.query(models.Subscription).filter(models.Subscription.id == subscription_id).first()
 
 def deactivate_subscription(db: Session, subscription_id: int):
     subscription = db.query(models.Subscription).filter(models.Subscription.id == subscription_id).first()
@@ -52,9 +58,9 @@ def deactivate_subscription(db: Session, subscription_id: int):
     return subscription
 
 # VPNConfig CRUD operations
-def create_vpn_config(db: Session, user_id: int, config_name: str, config_content: str):
+def create_vpn_config(db: Session, subscription_id: int, config_name: str, config_content: str):
     db_config = models.VPNConfig(
-        user_id=user_id,
+        subscription_id=subscription_id,
         config_name=config_name,
         config_content=config_content,
         is_active=True
@@ -64,14 +70,31 @@ def create_vpn_config(db: Session, user_id: int, config_name: str, config_conten
     db.refresh(db_config)
     return db_config
 
-def get_user_vpn_configs(db: Session, user_id: int):
-    return db.query(models.VPNConfig).filter(models.VPNConfig.user_id == user_id).all()
-
-def get_active_vpn_config(db: Session, user_id: int):
+def get_subscription_vpn_config(db: Session, subscription_id: int):
     return db.query(models.VPNConfig).filter(
-        models.VPNConfig.user_id == user_id,
+        models.VPNConfig.subscription_id == subscription_id,
         models.VPNConfig.is_active == True
     ).first()
+
+def get_user_active_vpn_config(db: Session, user_id: int):
+    """Получает активную VPN конфигурацию пользователя через активную подписку"""
+    active_subscription = get_active_subscription(db, user_id)
+    if not active_subscription:
+        return None
+    return get_subscription_vpn_config(db, active_subscription.id)
+
+def get_user_all_vpn_configs(db: Session, user_id: int):
+    """Получает все VPN конфигурации пользователя через все его подписки"""
+    user = get_user_by_tg_id(db, user_id)
+    if not user:
+        return []
+    user_subscriptions = get_user_subscriptions(db, user.id)
+    all_configs = []
+    for subscription in user_subscriptions:
+        config = get_subscription_vpn_config(db, subscription.id)
+        if config:
+            all_configs.append(config)
+    return all_configs
 
 def deactivate_vpn_config(db: Session, config_id: int):
     config = db.query(models.VPNConfig).filter(models.VPNConfig.id == config_id).first()
