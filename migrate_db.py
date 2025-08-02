@@ -14,69 +14,162 @@ def migrate_database():
     models.Base.metadata.create_all(bind=engine)
     
     with engine.connect() as connection:
-        # Проверяем, существует ли старая таблица vpn_configs
+        print("Начинаем миграцию базы данных...")
+        
+        # Проверяем существующие таблицы
+        tables_result = connection.execute(text("""
+            SELECT table_name FROM information_schema.tables 
+            WHERE table_schema = 'public'
+            ORDER BY table_name;
+        """))
+        existing_tables = [row[0] for row in tables_result]
+        print(f"Существующие таблицы: {existing_tables}")
+        
+        # Проверяем структуру таблицы users
+        if 'users' in existing_tables:
+            columns_result = connection.execute(text("""
+                SELECT column_name, data_type FROM information_schema.columns 
+                WHERE table_name = 'users'
+                ORDER BY column_name;
+            """))
+            user_columns = {row[0]: row[1] for row in columns_result}
+            print(f"Колонки таблицы users: {user_columns}")
+        
+        # Проверяем, существует ли старая таблица subscriptions
         result = connection.execute(text("""
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
-                WHERE table_name = 'vpn_configs'
+                WHERE table_name = 'subscriptions'
             );
         """))
         
         if result.scalar():
-            # Проверяем, есть ли колонка user_id в старой таблице
-            result = connection.execute(text("""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_name = 'vpn_configs' AND column_name = 'user_id'
-                );
+            print("Обнаружена старая структура с таблицей subscriptions")
+            print("Выполняем миграцию данных...")
+            
+            # Создаем базовые протоколы
+            connection.execute(text("""
+                INSERT INTO protocols (name, description) VALUES 
+                ('openvpn', 'OpenVPN протокол'),
+                ('wireguard', 'WireGuard протокол')
+                ON CONFLICT (name) DO NOTHING;
             """))
             
-            if result.scalar():
-                print("Обнаружена старая структура таблицы vpn_configs")
-                print("Выполняем миграцию...")
-                
-                # Создаем временную таблицу с новой структурой
-                connection.execute(text("""
-                    CREATE TABLE IF NOT EXISTS vpn_configs_new (
-                        id SERIAL PRIMARY KEY,
-                        subscription_id INTEGER REFERENCES subscriptions(id),
-                        config_name VARCHAR,
-                        config_content TEXT,
-                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                        is_active BOOLEAN DEFAULT TRUE
+            # Создаем базовый сервер (если нужно)
+            connection.execute(text("""
+                INSERT INTO servers (name, host, port, country) VALUES 
+                ('default_server', 'vpn.example.com', 1194, 'Unknown')
+                ON CONFLICT (name) DO NOTHING;
+            """))
+            
+            # Получаем ID базового сервера и протокола
+            server_result = connection.execute(text("SELECT id FROM servers WHERE name = 'default_server' LIMIT 1;"))
+            server_id = server_result.scalar()
+            
+            protocol_result = connection.execute(text("SELECT id FROM protocols WHERE name = 'openvpn' LIMIT 1;"))
+            protocol_id = protocol_result.scalar()
+            
+            if server_id and protocol_id:
+                # Проверяем, есть ли таблица vpn_configs
+                vpn_configs_exists = connection.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'vpn_configs'
                     );
-                """))
+                """)).scalar()
                 
-                # Копируем данные из старой таблицы в новую
-                # Для каждой VPN конфигурации находим активную подписку пользователя
-                connection.execute(text("""
-                    INSERT INTO vpn_configs_new (subscription_id, config_name, config_content, created_at, is_active)
-                    SELECT 
-                        s.id as subscription_id,
-                        vc.config_name,
-                        vc.config_content,
-                        vc.created_at,
-                        vc.is_active
-                    FROM vpn_configs vc
-                    JOIN users u ON vc.user_id = u.id
-                    JOIN subscriptions s ON u.id = s.user_id
-                    WHERE s.is_active = TRUE
-                    AND vc.is_active = TRUE;
-                """))
-                
-                # Удаляем старую таблицу
-                connection.execute(text("DROP TABLE vpn_configs;"))
-                
-                # Переименовываем новую таблицу
-                connection.execute(text("ALTER TABLE vpn_configs_new RENAME TO vpn_configs;"))
-                
-                print("Миграция завершена успешно!")
+                if vpn_configs_exists:
+                    # Проверяем колонки таблицы vpn_configs
+                    vpn_columns_result = connection.execute(text("""
+                        SELECT column_name FROM information_schema.columns 
+                        WHERE table_name = 'vpn_configs'
+                        ORDER BY column_name;
+                    """))
+                    vpn_columns = [row[0] for row in vpn_columns_result]
+                    print(f"Колонки таблицы vpn_configs: {vpn_columns}")
+                    
+                    # Мигрируем VPN конфигурации в новую структуру
+                    if 'user_id' in vpn_columns:
+                        connection.execute(text("""
+                            INSERT INTO user_configs (user_id, server_id, protocol_id, config_name, config_content, created_at, is_active)
+                            SELECT 
+                                u.id as user_id,
+                                %s as server_id,
+                                %s as protocol_id,
+                                COALESCE(vc.config_name, 'Migrated Config') as config_name,
+                                vc.config_content,
+                                COALESCE(vc.created_at, NOW()) as created_at,
+                                vc.is_active
+                            FROM vpn_configs vc
+                            JOIN users u ON vc.user_id = u.id
+                            WHERE vc.is_active = TRUE
+                            ON CONFLICT DO NOTHING;
+                        """), (server_id, protocol_id))
+                        
+                        # Создаем записи о покупках для существующих конфигов
+                        connection.execute(text("""
+                            INSERT INTO purchases (user_id, config_id, amount, duration_days, purchase_type, created_at)
+                            SELECT 
+                                uc.user_id,
+                                uc.id as config_id,
+                                0.00 as amount,
+                                30 as duration_days,
+                                'migration' as purchase_type,
+                                uc.created_at
+                            FROM user_configs uc
+                            WHERE uc.created_at IS NOT NULL
+                            ON CONFLICT DO NOTHING;
+                        """))
+                        
+                        print("Данные успешно мигрированы!")
+                    else:
+                        print("Таблица vpn_configs не содержит колонку user_id, пропускаем миграцию данных")
+                else:
+                    print("Таблица vpn_configs не существует, пропускаем миграцию данных")
             else:
-                print("Таблица vpn_configs уже имеет новую структуру")
+                print("Ошибка: не удалось найти базовый сервер или протокол")
+        
         else:
-            print("Таблица vpn_configs не существует, создаем новую структуру")
+            print("Старая структура не обнаружена, создаем новую базу данных")
+            
+            # Создаем базовые протоколы
+            connection.execute(text("""
+                INSERT INTO protocols (name, description) VALUES 
+                ('openvpn', 'OpenVPN протокол'),
+                ('wireguard', 'WireGuard протокол')
+                ON CONFLICT (name) DO NOTHING;
+            """))
+            
+            # Создаем базовый сервер
+            connection.execute(text("""
+                INSERT INTO servers (name, host, port, country) VALUES 
+                ('default_server', 'vpn.example.com', 1194, 'Unknown')
+                ON CONFLICT (name) DO NOTHING;
+            """))
+            
+            # Добавляем колонки для бесплатного пробного периода (если их нет)
+            try:
+                connection.execute(text("""
+                    ALTER TABLE users 
+                    ADD COLUMN IF NOT EXISTS free_trial_used BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS free_trial_expires_at TIMESTAMP WITH TIME ZONE;
+                """))
+                print("Колонки для бесплатного пробного периода добавлены")
+            except Exception as e:
+                print(f"Ошибка при добавлении колонок для бесплатного пробного периода: {e}")
+            
+            print("Базовая структура создана!")
+        
+        # Удаляем старые таблицы (если они существуют)
+        try:
+            connection.execute(text("DROP TABLE IF EXISTS vpn_configs CASCADE;"))
+            connection.execute(text("DROP TABLE IF EXISTS subscriptions CASCADE;"))
+            print("Старые таблицы удалены")
+        except Exception as e:
+            print(f"Ошибка при удалении старых таблиц: {e}")
         
         connection.commit()
+        print("Миграция завершена успешно!")
 
 if __name__ == "__main__":
     migrate_database() 

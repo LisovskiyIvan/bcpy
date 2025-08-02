@@ -25,7 +25,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Создаем таблицы в базе данных
 models.Base.metadata.create_all(bind=engine)
 
-
 app = FastAPI(title="VPN API")
 
 app.add_middleware(
@@ -47,7 +46,6 @@ app.add_middleware(
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-
 # Обработчик pre-checkout query
 @dp.pre_checkout_query()
 async def pre_checkout_query(query: PreCheckoutQuery):
@@ -67,30 +65,21 @@ def get_db():
         db.close()
 
 # Фоновые задачи
-async def cleanup_inactive():
+async def cleanup_expired_configs():
     while True:
         db = SessionLocal()
         try:
-            # Получаем все активные подписки
-            subscriptions = db.query(models.Subscription).filter(
-                models.Subscription.is_active == True
+            # Получаем все активные конфиги с истекшим сроком
+            current_time = datetime.now(UTC)
+            expired_configs = db.query(models.UserConfig).filter(
+                models.UserConfig.is_active == True,
+                models.UserConfig.expires_at < current_time
             ).all()
             
-            current_time = datetime.now(UTC)
-            for subscription in subscriptions:
-                # Убеждаемся, что end_date имеет информацию о часовом поясе
-                end_date = subscription.end_date
-                if end_date.tzinfo is None:
-                    # Если end_date не имеет информации о часовом поясе, считаем его UTC
-                    end_date = end_date.replace(tzinfo=UTC)
-                
-                if end_date < current_time:
-                    # Деактивируем подписку
-                    crud.deactivate_subscription(db, subscription.id)
-                    # Деактивируем связанную VPN конфигурацию
-                    vpn_config = crud.get_subscription_vpn_config(db, subscription.id)
-                    if vpn_config and vpn_config.is_active:
-                        crud.deactivate_vpn_config(db, vpn_config.id)
+            for config in expired_configs:
+                # Деактивируем конфиг
+                crud.deactivate_user_config(db, config.id)
+                print(f"Конфиг {config.id} деактивирован (истек срок)")
         finally:
             db.close()
         await asyncio.sleep(3600)  # Проверка каждый час
@@ -101,14 +90,31 @@ async def create_user(
     user_id: int = Query(..., alias="user_id"),
     username: str = Query(...),
     firstname: str = Query(...),
+    activate_trial: bool = Query(True, alias="activate_trial"),
+    trial_days: int = Query(7, alias="trial_days"),
     db: Session = Depends(get_db)
 ):
     db_user = crud.get_user_by_tg_id(db, user_id)
     if db_user:
         return {"message": "Пользователь уже существует", "user": db_user}
+    
     user = crud.create_user(db, tg_id=user_id, username=username, firstname=firstname)
-    subscription = crud.create_subscription(db, user_id=user.id, end_date=datetime.now(UTC) + timedelta(days=7))
-    return {"message": "success", "user": user, "subscription": subscription}
+    
+    # Активируем бесплатный пробный период, если запрошено
+    if activate_trial:
+        trial_user = crud.activate_free_trial(db, user.id, trial_days)
+        if trial_user:
+            return {
+                "message": "success", 
+                "user": user, 
+                "free_trial": {
+                    "activated": True,
+                    "expires_at": trial_user.free_trial_expires_at,
+                    "days": trial_days
+                }
+            }
+    
+    return {"message": "success", "user": user}
 
 @app.get("/api/users/{user_id}")
 async def get_user(user_id: int, db: Session = Depends(get_db)):
@@ -121,71 +127,110 @@ async def get_user(user_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     return db_user
 
-# Эндпоинты для работы с подписками
-@app.post("/api/subscriptions")
-async def create_subscription(
-    user_id: int = Query(..., alias="user_id"),
-    days: int = Query(..., alias="days"),
+@app.get("/api/users/{user_id}/free-trial")
+async def get_user_free_trial_status(user_id: int, db: Session = Depends(get_db)):
+    """Получить статус бесплатного пробного периода пользователя"""
+    trial_status = crud.get_user_free_trial_status(db, user_id)
+    if trial_status is None:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    return trial_status
+
+@app.post("/api/users/{user_id}/activate-trial")
+async def activate_user_free_trial(
+    user_id: int,
+    trial_days: int = Query(7, alias="trial_days"),
     db: Session = Depends(get_db)
 ):
-    db_user = crud.get_user_by_tg_id(db, user_id)
-    if not db_user:
+    """Активировать бесплатный пробный период для пользователя"""
+    # Проверяем существование пользователя
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    # Убеждаемся, что end_date создается с UTC
-    end_date = datetime.now(UTC) + timedelta(days=days)
-    return crud.create_subscription(db, user_id=db_user.id, end_date=end_date)
+    trial_user = crud.activate_free_trial(db, user.id, trial_days)
+    if not trial_user:
+        raise HTTPException(status_code=400, detail="Бесплатный пробный период уже использован или недоступен")
+    
+    return {
+        "message": "Бесплатный пробный период активирован",
+        "user": trial_user,
+        "free_trial": {
+            "activated": True,
+            "expires_at": trial_user.free_trial_expires_at,
+            "days": trial_days
+        }
+    }
 
-@app.delete("/api/subscriptions/user/{user_id}")
-async def delete_subscription_by_user_id(user_id: int, db: Session = Depends(get_db)):
-    subscription = crud.get_active_subscription(db, user_id)
-    if not subscription:
-        raise HTTPException(status_code=404, detail="Активная подписка не найдена")
-    deactivated = crud.deactivate_subscription(db, subscription.id)
-    if not deactivated:
-        raise HTTPException(status_code=500, detail="Не удалось деактивировать подписку")
-    return {"message": "Подписка деактивирована"}
+# Эндпоинты для работы с серверами
+@app.get("/api/servers")
+async def get_servers(db: Session = Depends(get_db)):
+    """Получить все активные серверы"""
+    servers = crud.get_active_servers(db)
+    return {"servers": servers}
 
-@app.put("/api/subscriptions/extend")
-async def extend_subscription(
-    user_id: int = Query(..., alias="user_id"),
-    days: int = Query(..., alias="days"),
+@app.post("/api/servers")
+async def create_server(
+    name: str = Query(...),
+    host: str = Query(...),
+    port: int = Query(...),
+    country: str = Query(None),
     db: Session = Depends(get_db)
 ):
-    subscription = crud.get_active_subscription(db, user_id)
-    if not subscription:
-        raise HTTPException(status_code=404, detail="Активная подписка не найдена")
-    
-    # Убеждаемся, что end_date имеет информацию о часовом поясе
-    if subscription.end_date.tzinfo is None:
-        subscription.end_date = subscription.end_date.replace(tzinfo=UTC)
-    
-    subscription.end_date += timedelta(days=days)
-    db.commit()
-    db.refresh(subscription)
-    return subscription
+    """Создать новый сервер"""
+    try:
+        server = crud.create_server(db, name=name, host=host, port=port, country=country)
+        return server
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-# Эндпоинты для работы с VPN
-@app.post("/api/vpn")
-async def create_vpn(
-    user_id: int = Query(..., alias="user_id"),
+# Эндпоинты для работы с протоколами
+@app.get("/api/protocols")
+async def get_protocols(db: Session = Depends(get_db)):
+    """Получить все активные протоколы"""
+    protocols = crud.get_active_protocols(db)
+    return {"protocols": protocols}
+
+@app.post("/api/protocols")
+async def create_protocol(
+    name: str = Query(...),
+    description: str = Query(None),
     db: Session = Depends(get_db)
 ):
-    # Проверяем наличие активной подписки
-    active_subscription = crud.get_active_subscription(db, user_id)
-    if not active_subscription:
-        raise HTTPException(status_code=400, detail="Нет активной подписки")
+    """Создать новый протокол"""
+    try:
+        protocol = crud.create_protocol(db, name=name, description=description)
+        return protocol
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# Эндпоинты для работы с конфигурациями пользователей
+@app.post("/api/configs")
+async def create_user_config(
+    user_id: int = Query(..., alias="user_id"),
+    server_id: int = Query(..., alias="server_id"),
+    protocol_id: int = Query(..., alias="protocol_id"),
+    config_name: str = Query(...),
+    duration_days: int = Query(30),
+    db: Session = Depends(get_db)
+):
+    """Создать новую конфигурацию для пользователя"""
+    # Проверяем существование пользователя
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
     
-    # Проверяем, есть ли уже VPN конфигурация для этой подписки
-    existing_config = crud.get_subscription_vpn_config(db, active_subscription.id)
-    if existing_config:
-        raise HTTPException(status_code=400, detail="VPN конфигурация уже существует для этой подписки")
+    # Проверяем существование сервера
+    server = crud.get_server(db, server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail="Сервер не найден")
     
-    # Генерируем уникальное имя для конфига
-    config_name = f"user_{user_id}_sub_{active_subscription.id}_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}"
+    # Проверяем существование протокола
+    protocol = crud.get_protocol(db, protocol_id)
+    if not protocol:
+        raise HTTPException(status_code=404, detail="Протокол не найден")
     
     try:
-        # Создаем VPN конфигурацию на сервере
+        # Создаем VPN конфигурацию на сервере через ovpn.py
         config_content = ovpn.create_openvpn_user(
             client_name=config_name,
             hostname=SSH_HOST,
@@ -195,41 +240,51 @@ async def create_vpn(
         )
         
         # Сохраняем конфигурацию в базе данных
-        return crud.create_vpn_config(
-            db,
-            subscription_id=active_subscription.id,
+        config = crud.create_user_config(
+            db, 
+            user_id=user.id, 
+            server_id=server_id, 
+            protocol_id=protocol_id,
             config_name=config_name,
-            config_content=config_content
+            config_content=config_content,
+            duration_days=duration_days
         )
+        
+        return config
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Ошибка при создании VPN конфигурации: {str(e)}")
 
-@app.get("/api/vpn/{user_id}")
-async def get_vpn(user_id: int, db: Session = Depends(get_db)):
-    vpn_config = crud.get_user_active_vpn_config(db, user_id)
-    if not vpn_config:
-        raise HTTPException(status_code=404, detail="VPN конфигурация не найдена")
-    return vpn_config
+@app.get("/api/configs/user/{user_id}")
+async def get_user_configs(user_id: int, db: Session = Depends(get_db)):
+    """Получить все конфигурации пользователя"""
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    configs = crud.get_user_all_configs(db, user.id)
+    return {"configs": configs}
 
-@app.get("/api/vpn/{user_id}/all")
-async def get_all_user_vpn_configs(user_id: int, db: Session = Depends(get_db)):
-    """Получить все VPN конфигурации пользователя"""
-    vpn_configs = crud.get_user_all_vpn_configs(db, user_id)
-    return {"configs": vpn_configs}
+@app.get("/api/configs/user/{user_id}/active")
+async def get_user_active_configs(user_id: int, db: Session = Depends(get_db)):
+    """Получить активные конфигурации пользователя"""
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    configs = crud.get_user_active_configs(db, user.id)
+    return {"configs": configs}
 
-@app.delete("/api/vpn/{user_id}")
-async def delete_vpn(
-    user_id: int,
-    db: Session = Depends(get_db)
-):
-    vpn_config = crud.get_user_active_vpn_config(db, user_id)
-    if not vpn_config:
-        raise HTTPException(status_code=404, detail="VPN конфигурация не найдена")
+@app.delete("/api/configs/{config_id}")
+async def deactivate_config(config_id: int, db: Session = Depends(get_db)):
+    """Деактивировать конфигурацию и удалить VPN пользователя на сервере"""
+    config = crud.get_user_config(db, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Конфигурация не найдена")
     
     try:
         # Удаляем VPN конфигурацию на сервере
         success = ovpn.revoke_openvpn_user(
-            client_name=vpn_config.config_name,
+            client_name=config.config_name,
             hostname=SSH_HOST,
             username=SSH_USERNAME,
             password=SSH_PASSWORD,
@@ -238,14 +293,207 @@ async def delete_vpn(
         
         if success:
             # Деактивируем конфигурацию в базе данных
-            crud.deactivate_vpn_config(db, vpn_config.id)
-            return {"message": "VPN конфигурация удалена"}
+            crud.deactivate_user_config(db, config_id)
+            return {"message": "Конфигурация деактивирована и удалена с сервера"}
         else:
             raise HTTPException(status_code=500, detail="Ошибка при удалении VPN конфигурации на сервере")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
+        raise HTTPException(status_code=500, detail=f"Ошибка при деактивации конфигурации: {str(e)}")
 
+@app.put("/api/configs/{config_id}/extend")
+async def extend_config(
+    config_id: int,
+    additional_days: int = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Продлить конфигурацию"""
+    config = crud.extend_user_config(db, config_id, additional_days)
+    if not config:
+        raise HTTPException(status_code=404, detail="Конфигурация не найдена")
+    return config
+
+@app.post("/api/configs/{config_id}/send-to-telegram")
+async def send_config_to_telegram(
+    config_id: int,
+    chat_id: int = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Отправить файл конфигурации в Telegram чат"""
+    config = crud.get_user_config(db, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Конфигурация не найдена")
+    
+    if not config.is_active:
+        raise HTTPException(status_code=400, detail="Конфигурация неактивна")
+    
+    try:
+        # Создаем содержимое файла
+        config_content = config.config_content.encode('utf-8')
+        
+        # Отправляем файл в Telegram
+        from aiogram.types import BufferedInputFile
+        await bot.send_document(
+            chat_id=chat_id,
+            document=BufferedInputFile(
+                file=config_content,
+                filename=f"vpn_config_{config.config_name}.ovpn"
+            ),
+            caption=f"🔐 Ваш VPN конфигурационный файл\n"
+                   f"📅 Действует до: {config.expires_at.strftime('%Y-%m-%d') if config.expires_at else 'Бессрочно'}\n"
+                   f"🖥️ Сервер: {config.server.name}\n"
+                   f"📡 Протокол: {config.protocol.name}"
+        )
+        
+        return {"message": "Файл конфигурации отправлен в Telegram"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при отправке файла: {str(e)}")
+
+# Эндпоинты для работы с покупками
+@app.post("/api/purchases")
+async def create_purchase(
+    user_id: int = Query(..., alias="user_id"),
+    config_id: int = Query(..., alias="config_id"),
+    amount: float = Query(...),
+    duration_days: int = Query(...),
+    purchase_type: str = Query("new"),
+    db: Session = Depends(get_db)
+):
+    """Создать запись о покупке"""
+    # Проверяем существование пользователя
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Проверяем существование конфигурации
+    config = crud.get_user_config(db, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Конфигурация не найдена")
+    
+    purchase = crud.create_purchase(
+        db, 
+        user_id=user.id, 
+        config_id=config_id,
+        amount=amount,
+        duration_days=duration_days,
+        purchase_type=purchase_type
+    )
+    return purchase
+
+@app.get("/api/purchases/user/{user_id}")
+async def get_user_purchases(user_id: int, db: Session = Depends(get_db)):
+    """Получить все покупки пользователя"""
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    purchases = crud.get_user_purchases(db, user.id)
+    return {"purchases": purchases}
+
+# Комбинированные эндпоинты для покупки конфигураций
+@app.post("/api/buy-config")
+async def buy_new_config(
+    user_id: int = Query(..., alias="user_id"),
+    server_id: int = Query(..., alias="server_id"),
+    protocol_id: int = Query(..., alias="protocol_id"),
+    config_name: str = Query(...),
+    config_content: str = Query(...),
+    amount: float = Query(0.0),  # По умолчанию 0 для бесплатного пробного периода
+    duration_days: int = Query(30),
+    use_free_trial: bool = Query(False, alias="use_free_trial"),
+    db: Session = Depends(get_db)
+):
+    """Покупка новой конфигурации с поддержкой бесплатного пробного периода"""
+    # Проверяем существование пользователя
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Проверяем статус бесплатного пробного периода
+    trial_status = crud.get_user_free_trial_status(db, user_id)
+    if not trial_status:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    # Если запрошен бесплатный пробный период
+    if use_free_trial:
+        if not trial_status["available"]:
+            raise HTTPException(status_code=400, detail="Бесплатный пробный период недоступен")
+        
+        # Активируем бесплатный пробный период
+        trial_user = crud.activate_free_trial(db, user.id, 7)  # 7 дней пробного периода
+        if not trial_user:
+            raise HTTPException(status_code=400, detail="Не удалось активировать бесплатный пробный период")
+        
+        # Создаем конфигурацию с нулевой стоимостью
+        try:
+            config, purchase = crud.buy_new_config(
+                db, 
+                user_id=user.id,
+                server_id=server_id,
+                protocol_id=protocol_id,
+                config_name=config_name,
+                config_content=config_content,
+                amount=0.0,  # Бесплатно
+                duration_days=7  # 7 дней пробного периода
+            )
+            return {
+                "config": config, 
+                "purchase": purchase,
+                "free_trial": {
+                    "used": True,
+                    "expires_at": trial_user.free_trial_expires_at
+                }
+            }
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        # Обычная покупка
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="Сумма покупки должна быть больше 0")
+        
+        try:
+            config, purchase = crud.buy_new_config(
+                db, 
+                user_id=user.id,
+                server_id=server_id,
+                protocol_id=protocol_id,
+                config_name=config_name,
+                config_content=config_content,
+                amount=amount,
+                duration_days=duration_days
+            )
+            return {"config": config, "purchase": purchase}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/renew-config")
+async def renew_config(
+    config_id: int = Query(..., alias="config_id"),
+    user_id: int = Query(..., alias="user_id"),
+    amount: float = Query(...),
+    duration_days: int = Query(...),
+    db: Session = Depends(get_db)
+):
+    """Продление существующей конфигурации"""
+    # Проверяем существование пользователя
+    user = crud.get_user_by_tg_id(db, user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="Пользователь не найден")
+    
+    try:
+        config, purchase = crud.renew_config(
+            db,
+            config_id=config_id,
+            user_id=user.id,
+            amount=amount,
+            duration_days=duration_days
+        )
+        return {"config": config, "purchase": purchase}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+# Эндпоинт для создания инвойса (оставляем без изменений)
 from fastapi.responses import JSONResponse
 
 @app.get("/api/create_invoice")
@@ -275,7 +523,7 @@ async def create_invoice(title: str, description: str, payload: str, price: int)
 
 @app.on_event("startup")
 async def startup_event():
-    asyncio.create_task(cleanup_inactive())
+    asyncio.create_task(cleanup_expired_configs())
     asyncio.create_task(start_bot())
 
 async def start_bot():

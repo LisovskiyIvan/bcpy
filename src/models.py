@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Boolean, Text, Numeric
 from sqlalchemy.orm import relationship
 from datetime import datetime, UTC
 from .database import Base
@@ -10,33 +10,70 @@ class User(Base):
     tgId = Column(Integer, unique=True, index=True)
     username = Column(String, unique=True, index=True)
     firstname = Column(String)
+    free_trial_used = Column(Boolean, default=False)  # Использовал ли пользователь бесплатный пробный период
+    free_trial_expires_at = Column(DateTime, nullable=True)  # Дата истечения бесплатного пробного периода
     
     # Связи с другими таблицами
-    subscriptions = relationship("Subscription", back_populates="user")
+    configs = relationship("UserConfig", back_populates="user")
+    purchases = relationship("Purchase", back_populates="user")
 
-class Subscription(Base):
-    __tablename__ = "subscriptions"
+class Server(Base):
+    __tablename__ = "servers"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    host = Column(String, nullable=False)
+    port = Column(Integer, nullable=False)
+    country = Column(String)
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    
+    # Связи
+    configs = relationship("UserConfig", back_populates="server")
+
+class Protocol(Base):
+    __tablename__ = "protocols"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)  # openvpn, wireguard, etc.
+    description = Column(String)
+    is_active = Column(Boolean, default=True)
+    
+    # Связи
+    configs = relationship("UserConfig", back_populates="protocol")
+
+class UserConfig(Base):
+    __tablename__ = "user_configs"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"))
-    start_date = Column(DateTime, default=lambda: datetime.now(UTC))
-    end_date = Column(DateTime, default=lambda: datetime.now(UTC))
+    server_id = Column(Integer, ForeignKey("servers.id"))
+    protocol_id = Column(Integer, ForeignKey("protocols.id"))
+    
+    config_name = Column(String)
+    config_content = Column(Text)  # Содержимое конфигурационного файла
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime, nullable=True)  # Дата истечения конфига
     is_active = Column(Boolean, default=True)
     
-    # Связь с пользователем
-    user = relationship("User", back_populates="subscriptions")
-    # Связь с VPN конфигурацией
-    vpn_config = relationship("VPNConfig", back_populates="subscription", uselist=False)
+    # Связи
+    user = relationship("User", back_populates="configs")
+    server = relationship("Server", back_populates="configs")
+    protocol = relationship("Protocol", back_populates="configs")
+    purchases = relationship("Purchase", back_populates="config")
 
-class VPNConfig(Base):
-    __tablename__ = "vpn_configs"
+class Purchase(Base):
+    __tablename__ = "purchases"
 
     id = Column(Integer, primary_key=True, index=True)
-    subscription_id = Column(Integer, ForeignKey("subscriptions.id"))
-    config_name = Column(String)
-    config_content = Column(String)  # Содержимое .ovpn файла
-    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
-    is_active = Column(Boolean, default=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    config_id = Column(Integer, ForeignKey("user_configs.id"))
     
-    # Связь с подпиской
-    subscription = relationship("Subscription", back_populates="vpn_config")
+    amount = Column(Numeric(10, 2), nullable=False)  # Сумма покупки
+    duration_days = Column(Integer, nullable=False)  # Продолжительность в днях
+    purchase_type = Column(String)  # "new", "renewal"
+    created_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    
+    # Связи
+    user = relationship("User", back_populates="purchases")
+    config = relationship("UserConfig", back_populates="purchases")
