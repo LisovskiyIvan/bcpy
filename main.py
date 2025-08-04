@@ -53,7 +53,8 @@ async def pre_checkout_query(query: PreCheckoutQuery):
 # Обработчик успешной оплаты
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
-    await bot.refund_star_payment(message.from_user.id, message.successful_payment.telegram_payment_charge_id)
+    # await bot.refund_star_payment(message.from_user.id, message.successful_payment.telegram_payment_charge_id)
+    await bot.send_message(message.from_user.id, "Payment successful")
 
 # Dependency для получения сессии базы данных
 def get_db():
