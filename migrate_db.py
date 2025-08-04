@@ -3,6 +3,7 @@ from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 from src.database import engine
 from src import models
+from src.database import DATABASE_URL
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -171,5 +172,53 @@ def migrate_database():
         connection.commit()
         print("Миграция завершена успешно!")
 
+def migrate_notification_logs():
+    """Добавляет таблицу notification_logs в базу данных"""
+    engine = create_engine(DATABASE_URL)
+    
+    with engine.connect() as conn:
+        # Проверяем, существует ли таблица
+        result = conn.execute(text("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='notification_logs'
+        """))
+        
+        if not result.fetchone():
+            # Создаем таблицу notification_logs
+            conn.execute(text("""
+                CREATE TABLE notification_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    config_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    notification_type VARCHAR NOT NULL,
+                    sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expires_at DATETIME NOT NULL,
+                    FOREIGN KEY (config_id) REFERENCES user_configs (id),
+                    FOREIGN KEY (user_id) REFERENCES users (id)
+                )
+            """))
+            
+            # Создаем индексы для оптимизации запросов
+            conn.execute(text("""
+                CREATE INDEX idx_notification_logs_config_id 
+                ON notification_logs (config_id)
+            """))
+            
+            conn.execute(text("""
+                CREATE INDEX idx_notification_logs_user_id 
+                ON notification_logs (user_id)
+            """))
+            
+            conn.execute(text("""
+                CREATE INDEX idx_notification_logs_type 
+                ON notification_logs (notification_type)
+            """))
+            
+            conn.commit()
+            print("✅ Таблица notification_logs успешно создана")
+        else:
+            print("ℹ️ Таблица notification_logs уже существует")
+
 if __name__ == "__main__":
-    migrate_database() 
+    migrate_database()
+    migrate_notification_logs() 

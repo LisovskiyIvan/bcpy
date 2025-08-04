@@ -30,12 +30,8 @@ app = FastAPI(title="VPN API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://t5kxd472-5173.euw.devtunnels.ms",
-        "https://t5kxd472.euw.devtunnels.ms",
-        "https://t5kxd472.euw.devtunnels.ms:8000",
         "http://localhost:5173",
-        "http://localhost:3000",
-        "*"  # Временно разрешаем все origins для отладки
+        "https://t5kxd472-5173.euw.devtunnels.ms"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -83,6 +79,67 @@ async def cleanup_expired_configs():
         finally:
             db.close()
         await asyncio.sleep(3600)  # Проверка каждый час
+
+async def send_expiration_notifications():
+    """Отправляет уведомления о скором истечении конфигураций"""
+    while True:
+        db = SessionLocal()
+        try:
+            # Получаем конфиги, которые истекают через 24 часа
+            expiring_configs = crud.get_configs_expiring_soon(db, hours_before=24)
+            
+            for config in expiring_configs:
+                # Проверяем, не было ли уже отправлено уведомление
+                if not crud.has_expiration_notification_sent(db, config.id):
+                    try:
+                        # Отправляем уведомление пользователю
+                        await send_expiration_warning_message(config)
+                        
+                        # Создаем запись об отправленном уведомлении
+                        crud.create_notification_log(
+                            db, 
+                            config_id=config.id,
+                            user_id=config.user_id,
+                            notification_type="expiration_warning",
+                            expires_at=config.expires_at
+                        )
+                        
+                        print(f"Отправлено уведомление об истечении для конфига {config.id}")
+                    except Exception as e:
+                        print(f"Ошибка при отправке уведомления для конфига {config.id}: {str(e)}")
+        finally:
+            db.close()
+        
+        # Проверяем каждые 6 часов
+        await asyncio.sleep(6 * 3600)
+
+async def send_expiration_warning_message(config):
+    """Отправляет сообщение с предупреждением об истечении конфигурации"""
+    try:
+        # Форматируем дату истечения
+        expires_date = config.expires_at.strftime("%d.%m.%Y в %H:%M")
+        
+        # Создаем сообщение
+        message = (
+            f"⚠️ **Внимание! Ваша VPN конфигурация скоро истечет**\n\n"
+            f"📅 **Дата истечения:** {expires_date}\n"
+            f"🖥️ **Сервер:** {config.server.country}\n"
+            f"📡 **Протокол:** {config.protocol.name}\n"
+            f"📁 **Конфигурация:** {config.config_name}\n\n"
+            f"🔗 Для продления конфигурации используйте наш бот или веб-интерфейс.\n"
+            f"💡 Не забудьте продлить конфигурацию до истечения срока!"
+        )
+        
+        # Отправляем сообщение пользователю
+        await bot.send_message(
+            chat_id=config.user.tgId,
+            text=message,
+            parse_mode="Markdown"
+        )
+        
+    except Exception as e:
+        print(f"Ошибка при отправке уведомления пользователю {config.user.tgId}: {str(e)}")
+        raise e
 
 # Эндпоинты для работы с пользователями
 @app.post("/api/users")
@@ -340,13 +397,43 @@ async def send_config_to_telegram(
             ),
             caption=f"🔐 Ваш VPN конфигурационный файл\n"
                    f"📅 Действует до: {config.expires_at.strftime('%Y-%m-%d') if config.expires_at else 'Бессрочно'}\n"
-                   f"🖥️ Сервер: {config.server.name}\n"
+                   f"🖥️ Сервер: {config.server.country}\n"
                    f"📡 Протокол: {config.protocol.name}"
         )
         
         return {"message": "Файл конфигурации отправлен в Telegram"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка при отправке файла: {str(e)}")
+
+@app.post("/api/configs/{config_id}/send-expiration-notification")
+async def send_expiration_notification(
+    config_id: int,
+    db: Session = Depends(get_db)
+):
+    """Отправить уведомление об истечении конфигурации (для тестирования)"""
+    config = crud.get_user_config(db, config_id)
+    if not config:
+        raise HTTPException(status_code=404, detail="Конфигурация не найдена")
+    
+    if not config.is_active:
+        raise HTTPException(status_code=400, detail="Конфигурация неактивна")
+    
+    try:
+        # Отправляем уведомление
+        await send_expiration_warning_message(config)
+        
+        # Создаем запись об отправленном уведомлении
+        crud.create_notification_log(
+            db, 
+            config_id=config.id,
+            user_id=config.user_id,
+            notification_type="expiration_warning",
+            expires_at=config.expires_at
+        )
+        
+        return {"message": "Уведомление об истечении отправлено"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Ошибка при отправке уведомления: {str(e)}")
 
 # Эндпоинты для работы с покупками
 @app.post("/api/purchases")
@@ -524,6 +611,7 @@ async def create_invoice(title: str, description: str, payload: str, price: int)
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(cleanup_expired_configs())
+    asyncio.create_task(send_expiration_notifications())
     asyncio.create_task(start_bot())
 
 async def start_bot():

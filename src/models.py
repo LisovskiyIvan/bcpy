@@ -77,3 +77,17 @@ class Purchase(Base):
     # Связи
     user = relationship("User", back_populates="purchases")
     config = relationship("UserConfig", back_populates="purchases")
+
+class NotificationLog(Base):
+    __tablename__ = "notification_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    config_id = Column(Integer, ForeignKey("user_configs.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))
+    notification_type = Column(String)  # "expiration_warning"
+    sent_at = Column(DateTime, default=lambda: datetime.now(UTC))
+    expires_at = Column(DateTime)  # Дата истечения конфига на момент отправки уведомления
+    
+    # Связи
+    config = relationship("UserConfig")
+    user = relationship("User")
