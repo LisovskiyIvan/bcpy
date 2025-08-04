@@ -306,8 +306,11 @@ async def create_user_config(
             config_content=config_content,
             duration_days=duration_days
         )
-        
-        return config
+        res = {
+            **config.__dict__,
+            "server_country": server.country,
+        }
+        return res
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ошибка при создании VPN конфигурации: {str(e)}")
 
