@@ -31,7 +31,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "https://t5kxd472-5173.euw.devtunnels.ms"
+        "http://localhost:80",
+        "http://localhost",
+        "https://t5kxd472-80.euw.devtunnels.ms",
+        "*"
     ],
     allow_credentials=True,
     allow_methods=["*"],
