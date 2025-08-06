@@ -1,6 +1,8 @@
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, PreCheckoutQuery
 from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, UTC
 import asyncio
@@ -40,6 +42,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # Инициализация бота и диспетчера
 bot = Bot(token=BOT_TOKEN)
@@ -614,6 +617,35 @@ async def create_invoice(title: str, description: str, payload: str, price: int)
         return {"invoice": invoice}
     except Exception as e:
         return JSONResponse(status_code=500, content={"detail": f"Ошибка при создании инвойса: {str(e)}"})
+    
+# # Монтируем статические файлы фронтенда
+# if os.path.exists("static"):
+#     app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# # Корневой маршрут для SPA
+# @app.get("/")
+# async def read_index():
+#     return FileResponse("static/index.html")
+
+# # Fallback для SPA роутинга - только для HTML страниц
+# @app.get("/{full_path:path}")
+# async def serve_spa(full_path: str):
+#     # Если запрос к API, пропускаем
+#     if full_path.startswith("api/"):
+#         raise HTTPException(status_code=404, detail="API endpoint not found")
+    
+#     # Если запрос к статическим файлам, пропускаем
+#     if full_path.startswith("static/"):
+#         raise HTTPException(status_code=404, detail="Static file not found")
+    
+#     # Проверяем, существует ли файл
+#     file_path = f"static/{full_path}"
+#     if os.path.exists(file_path):
+#         return FileResponse(file_path)
+    
+#     # Для всех остальных запросов возвращаем index.html
+#     return FileResponse("static/index.html")
+
 
 @app.on_event("startup")
 async def startup_event():
